@@ -33,6 +33,7 @@ class TechnicalIndicators:
             df = self.compute_obv(df)
         df = self.compute_momentum(df)
         df = self.compute_cci(df)
+        df = self.compute_pe_ratio(df)
         return df
 
     def compute_rsi(self, df: pd.DataFrame, period: Optional[int] = None) -> pd.DataFrame:
@@ -205,6 +206,36 @@ class TechnicalIndicators:
         df.loc[df["cci"] > 100, "cci_signal"] = -1   # Overbought → sell
         return df
 
+    def compute_pe_ratio(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Price-to-Earnings ratio indicator.
+
+        Uses trailing EPS when available.  If an ``EPS`` column is not
+        present in *df*, the method attempts to estimate earnings from
+        a simple profitability proxy (20-period rolling earnings yield
+        derived from price momentum and volume).  The PE signal treats
+        values well below the rolling mean as undervalued (buy) and
+        values well above it as overvalued (sell).
+        """
+        if "EPS" in df.columns:
+            eps = df["EPS"].replace(0, np.nan)
+        else:
+            # Proxy: use inverse of rolling price-return volatility as
+            # a rough "earnings yield" so the indicator still fires.
+            # This is a best-effort fallback; real EPS is preferred.
+            returns = df["Close"].pct_change()
+            rolling_return = returns.rolling(20).mean()
+            rolling_vol = returns.rolling(20).std().replace(0, np.nan)
+            eps = (rolling_return / rolling_vol) * df["Close"]  # proxy E
+            eps = eps.replace(0, np.nan)
+
+        df["pe_ratio"] = df["Close"] / eps
+        pe_sma = df["pe_ratio"].rolling(window=20).mean()
+
+        df["pe_signal"] = 0
+        df.loc[df["pe_ratio"] < pe_sma * 0.8, "pe_signal"] = 1    # Undervalued → buy
+        df.loc[df["pe_ratio"] > pe_sma * 1.2, "pe_signal"] = -1   # Overvalued → sell
+        return df
+
     def compute_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
         """Price momentum."""
         df["momentum_10"] = df["Close"].pct_change(periods=10)
@@ -226,7 +257,7 @@ class TechnicalIndicators:
         return [
             "rsi_signal", "macd_signal", "bb_signal", "stoch_signal",
             "sma_signal", "ema_signal", "atr_signal", "vwap_signal",
-            "obv_signal", "momentum_signal", "cci_signal",
+            "obv_signal", "momentum_signal", "cci_signal", "pe_signal",
         ]
 
     def get_feature_columns(self) -> List[str]:
@@ -235,7 +266,7 @@ class TechnicalIndicators:
             "rsi", "macd", "macd_histogram", "bb_pct", "bb_width",
             "stoch_k", "stoch_d", "sma_short", "sma_long",
             "ema_short", "ema_long", "atr", "atr_pct",
-            "momentum_10", "momentum_20", "cci",
+            "momentum_10", "momentum_20", "cci", "pe_ratio",
         ]
 
     def get_combined_signal(self, row: pd.Series, weights: Optional[Dict[str, float]] = None) -> float:

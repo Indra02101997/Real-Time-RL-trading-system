@@ -61,6 +61,8 @@ class PortfolioManager:
         self.trade_history: List[TradeRecord] = []
         self.realized_pnl = 0.0
         self.peak_value = self.initial_capital
+        self.total_brokerage_paid = 0.0
+        self.brokerage_per_trade = config.trading.brokerage_per_trade
 
     @property
     def total_position_value(self) -> float:
@@ -108,13 +110,15 @@ class PortfolioManager:
                     strategy_signals: Dict[str, int] = None,
                     sentiment_score: float = 0.0,
                     q_values: list = None) -> bool:
-        """Record a buy execution."""
-        cost = quantity * price
+        """Record a buy execution (includes brokerage cost)."""
+        brokerage = self.brokerage_per_trade
+        cost = quantity * price + brokerage
         if cost > self.cash:
-            logger.warning(f"Insufficient cash for {symbol}: need {cost:.2f}, have {self.cash:.2f}")
+            logger.warning(f"Insufficient cash for {symbol}: need {cost:.2f} (incl. ₹{brokerage} brokerage), have {self.cash:.2f}")
             return False
 
         self.cash -= cost
+        self.total_brokerage_paid += brokerage
         sl = price * (1 - self.config.trading.stop_loss_pct)
         tp = price * (1 + self.config.trading.take_profit_pct)
 
@@ -132,24 +136,28 @@ class PortfolioManager:
             q_values=q_values,
         ))
 
-        logger.info(f"BUY {quantity} {symbol} @ {price:.2f} | SL={sl:.2f} TP={tp:.2f}")
+        logger.info(f"BUY {quantity} {symbol} @ {price:.2f} | SL={sl:.2f} TP={tp:.2f} | Brokerage=₹{brokerage:.0f}")
         return True
 
     def execute_sell(self, symbol: str, price: float,
                      strategy_signals: Dict[str, int] = None,
                      sentiment_score: float = 0.0,
                      q_values: list = None) -> Tuple[bool, float]:
-        """Record a sell execution. Returns (success, pnl)."""
+        """Record a sell execution (includes brokerage cost). Returns (success, net_pnl)."""
         if symbol not in self.positions:
             logger.warning(f"No position to sell: {symbol}")
             return False, 0.0
 
         pos = self.positions[symbol]
-        revenue = pos.quantity * price
+        brokerage = self.brokerage_per_trade
+        revenue = pos.quantity * price - brokerage
         pnl = revenue - (pos.quantity * pos.avg_price)
+        # pnl already accounts for sell-side brokerage;
+        # buy-side brokerage was deducted from cash at entry.
 
         self.cash += revenue
         self.realized_pnl += pnl
+        self.total_brokerage_paid += brokerage
 
         self.trade_history.append(TradeRecord(
             symbol=symbol, action="SELL", quantity=pos.quantity,
@@ -162,7 +170,7 @@ class PortfolioManager:
         del self.positions[symbol]
         self.update_peak()
 
-        logger.info(f"SELL {pos.quantity} {symbol} @ {price:.2f} | PnL={pnl:.2f}")
+        logger.info(f"SELL {pos.quantity} {symbol} @ {price:.2f} | PnL=₹{pnl:.2f} (net of ₹{brokerage:.0f} brokerage)")
         return True, pnl
 
     def update_prices(self, prices: Dict[str, float]):
@@ -214,6 +222,7 @@ class PortfolioManager:
             "num_positions": len(self.positions),
             "total_trades": len(self.trade_history),
             "win_rate": winning / max(total_sells, 1),
+            "total_brokerage_paid": self.total_brokerage_paid,
             "positions": position_details,
         }
 

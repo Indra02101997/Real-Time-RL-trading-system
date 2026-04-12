@@ -23,6 +23,7 @@ class TradingConfig:
     max_positions: int = 20
     stop_loss_pct: float = 0.02  # 2% stop loss
     take_profit_pct: float = 0.05  # 5% take profit
+    brokerage_per_trade: float = 20.0  # Broker commission per order (₹20 for Zerodha)
     trading_start_hour: int = 9
     trading_start_minute: int = 15
     trading_end_hour: int = 15
@@ -104,8 +105,15 @@ class StrategyConfig:
     enabled_strategies: List[str] = field(default_factory=lambda: [
         "rsi", "macd", "bollinger_bands", "stochastic",
         "sma_crossover", "ema_crossover", "vwap", "atr",
-        "obv", "momentum", "mean_reversion", "cci"
+        "obv", "momentum", "mean_reversion", "cci", "pe_ratio"
     ])
+
+
+@dataclass
+class TelegramConfig:
+    bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    enabled: bool = True  # Set False to disable even if token is present
 
 
 @dataclass
@@ -117,6 +125,7 @@ class AppConfig:
     data: DataConfig = field(default_factory=DataConfig)
     news: NewsConfig = field(default_factory=NewsConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
     log_level: str = "INFO"
     model_save_dir: str = os.path.join(os.path.dirname(__file__), "..", "saved_models")
     device: str = "cuda"  # "cuda" or "cpu"

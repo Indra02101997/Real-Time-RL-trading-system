@@ -32,6 +32,7 @@ from models.strategy_selector import StrategySelector
 from trading.openalgo_trader import OpenAlgoTrader
 from trading.portfolio_manager import PortfolioManager
 from trading.stock_scanner import StockScanner, ScanAction
+from trading.telegram_notifier import TelegramNotifier
 from training.trainer import Trainer
 
 logging.basicConfig(
@@ -71,6 +72,9 @@ class NSERLTrader:
 
         # Stock scanner (5-min profitability ranking)
         self.scanner = StockScanner(self.config)
+
+        # Telegram notifications
+        self.telegram = TelegramNotifier(self.config)
 
         # FinBERT (lazy loaded)
         self.finbert: Optional[FinBERTSentiment] = None
@@ -129,6 +133,9 @@ class NSERLTrader:
         # Get trading symbols
         symbols = self.data_collector.get_nse_symbols()
         logger.info(f"Trading across {len(symbols)} NSE stocks")
+
+        # Telegram: market-open alert
+        self.telegram.notify_market_open(self.config.trading.initial_capital, len(symbols))
 
         self._running = True
 
@@ -271,6 +278,7 @@ class NSERLTrader:
         result = self.trader.place_sell_order(symbol, quantity, strategy="scanner_short")
         if result.get("status") == "success":
             logger.info(f"SHORT {quantity} {symbol} @ {price:.2f} (scanner)")
+            self.telegram.notify_short(symbol, quantity, price)
 
     def _build_state(self, symbol: str) -> Optional[np.ndarray]:
         """Build state vector for Q-learning from market data + sentiment."""
@@ -371,12 +379,14 @@ class NSERLTrader:
                     symbol, quantity, price,
                     sentiment_score=sentiment, q_values=q_values.tolist(),
                 )
+                self.telegram.notify_buy(symbol, quantity, price, confidence=confidence, sentiment=sentiment)
         else:
             # Paper trading without OpenAlgo
             self.portfolio.execute_buy(
                 symbol, quantity, price,
                 sentiment_score=sentiment, q_values=q_values.tolist(),
             )
+            self.telegram.notify_buy(symbol, quantity, price, confidence=confidence, sentiment=sentiment)
 
     def _handle_sell(self, symbol: str, price: float, q_values, sentiment: float):
         """Handle sell decision."""
@@ -394,6 +404,8 @@ class NSERLTrader:
                     sentiment_score=sentiment, q_values=q_values.tolist(),
                 )
                 if success:
+                    pnl_pct = pnl / (pos.quantity * pos.avg_price) if pos.avg_price else 0
+                    self.telegram.notify_sell(symbol, pos.quantity, price, pnl=pnl, pnl_pct=pnl_pct)
                     self._provide_rl_feedback(symbol, pnl)
         else:
             success, pnl = self.portfolio.execute_sell(
@@ -401,6 +413,8 @@ class NSERLTrader:
                 sentiment_score=sentiment, q_values=q_values.tolist(),
             )
             if success:
+                pnl_pct = pnl / (pos.quantity * pos.avg_price) if pos.avg_price else 0
+                self.telegram.notify_sell(symbol, pos.quantity, price, pnl=pnl, pnl_pct=pnl_pct)
                 self._provide_rl_feedback(symbol, pnl)
 
     def _provide_rl_feedback(self, symbol: str, pnl: float):
@@ -465,6 +479,11 @@ class NSERLTrader:
             logger.warning(f"Risk trigger: {symbol} hit {reason}")
             price = prices.get(symbol, 0)
             if price > 0:
+                pos = self.portfolio.positions.get(symbol)
+                if pos and reason == "stop_loss":
+                    self.telegram.notify_stop_loss(symbol, price, abs(pos.pnl_pct))
+                elif pos and reason == "take_profit":
+                    self.telegram.notify_take_profit(symbol, price, pos.pnl_pct)
                 self._handle_sell(symbol, price, np.zeros(3), 0.0)
 
     def _get_current_price(self, symbol: str) -> float:

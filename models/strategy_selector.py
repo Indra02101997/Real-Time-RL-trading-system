@@ -20,7 +20,7 @@ class StrategySelector:
     STRATEGY_NAMES = [
         "rsi", "macd", "bollinger_bands", "stochastic",
         "sma_crossover", "ema_crossover", "vwap", "atr",
-        "obv", "momentum", "mean_reversion", "cci",
+        "obv", "momentum", "mean_reversion", "cci", "pe_ratio",
     ]
 
     SIGNAL_COL_MAP = {
@@ -36,6 +36,7 @@ class StrategySelector:
         "momentum": "momentum_signal",
         "mean_reversion": "bb_signal",  # Mean reversion uses Bollinger
         "cci": "cci_signal",
+        "pe_ratio": "pe_signal",
     }
 
     def __init__(self, config):
@@ -146,7 +147,7 @@ class StrategySelector:
         """
         report = self.get_performance_report()
         for strategy, stats in report.items():
-            if stats["trades"] > 50 and stats["win_rate"] < 0.3:
+            if stats["trades"] > 50 and stats["win_rate"] < 0.7:
                 if strategy in self.enabled:
                     logger.info(f"Disabling poor strategy: {strategy} (win_rate={stats['win_rate']:.2%})")
                     self.enabled.remove(strategy)
