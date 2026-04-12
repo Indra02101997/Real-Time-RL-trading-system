@@ -1,0 +1,12 @@
+torch>=2.0.0
+transformers>=4.35.0
+tokenizers>=0.15.0
+numpy>=1.24.0
+pandas>=2.0.0
+yfinance>=0.2.30
+feedparser>=6.0.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+openalgo>=1.0.40
+pyarrow>=14.0.0
+scikit-learn>=1.3.0
