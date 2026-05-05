@@ -128,4 +128,5 @@ class AppConfig:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     log_level: str = "INFO"
     model_save_dir: str = os.path.join(os.path.dirname(__file__), "..", "saved_models")
+    state_dir: str = os.path.join(os.path.dirname(__file__), "..", "state")
     device: str = "cuda"  # "cuda" or "cpu"

@@ -14,7 +14,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,7 +30,7 @@ from models.finbert_sentiment import FinBERTSentiment
 from models.q_learning_agent import ACTION_BUY, ACTION_HOLD, ACTION_SELL, ACTION_NAMES
 from models.strategy_selector import StrategySelector
 from trading.openalgo_trader import OpenAlgoTrader
-from trading.portfolio_manager import PortfolioManager
+from trading.portfolio_manager import PortfolioManager, load_daily_state
 from trading.stock_scanner import StockScanner, ScanAction
 from trading.telegram_notifier import TelegramNotifier
 from training.trainer import Trainer
@@ -86,6 +86,8 @@ class NSERLTrader:
         self._symbol_states: Dict[str, np.ndarray] = {}
         self._symbol_data: Dict[str, pd.DataFrame] = {}
         self._sentiment_cache: Dict[str, float] = {}
+        # True once today's intraday positions have been squared off
+        self._squared_off_today: bool = False
 
     def initialize(self, load_models: bool = True):
         """Initialize all components."""
@@ -117,25 +119,48 @@ class NSERLTrader:
         logger.info("=" * 60)
         return report
 
-    def run_live_trading(self):
+    def run_live_trading(self, reset_capital: bool = False):
         """
         Main live trading loop.
         Runs during NSE trading hours (9:15 AM - 3:15 PM IST).
-        """
-        logger.info("=" * 60)
-        logger.info("STARTING LIVE TRADING")
-        logger.info(f"Initial Capital: ₹{self.config.trading.initial_capital:,.2f}")
-        logger.info("=" * 60)
 
+        Capital handling:
+            - Day 1 (or when ``reset_capital=True``): seed with
+              ``config.trading.initial_capital`` (default ₹10,000).
+            - Subsequent days: pull the current balance from the broker
+              (live mode) or carry forward the previous EOD closing balance
+              (paper mode) so the system trades with whatever it actually has.
+
+        Square-off:
+            - All long positions are sold and all open positions on the
+              broker are closed at ``square_off_hour:square_off_minute``
+              (default 15:10), well before the trading window ends.
+            - No new orders are placed after square-off.
+        """
         self.initialize(load_models=True)
         self.trader = OpenAlgoTrader(self.config)
+
+        # Determine today's starting capital from broker / saved state / config
+        starting_balance, source = self._determine_starting_balance(
+            reset_capital=reset_capital,
+        )
+        self.config.trading.initial_capital = starting_balance
+        self.portfolio.reset_for_new_session(starting_balance)
+        self._squared_off_today = False
+
+        logger.info("=" * 60)
+        logger.info("STARTING LIVE TRADING")
+        logger.info(f"Starting Capital: ₹{starting_balance:,.2f} (source: {source})")
+        logger.info(f"Seed Capital:     ₹{self.portfolio.seed_capital:,.2f}")
+        logger.info(f"Lifetime P&L:     ₹{self.portfolio.lifetime_realized_pnl:,.2f}")
+        logger.info("=" * 60)
 
         # Get trading symbols
         symbols = self.data_collector.get_nse_symbols()
         logger.info(f"Trading across {len(symbols)} NSE stocks")
 
         # Telegram: market-open alert
-        self.telegram.notify_market_open(self.config.trading.initial_capital, len(symbols))
+        self.telegram.notify_market_open(starting_balance, len(symbols))
 
         self._running = True
 
@@ -150,6 +175,17 @@ class NSERLTrader:
                         self._running = False
                         break
                     logger.info("Waiting for market open...")
+                    time.sleep(60)
+                    continue
+
+                # Square off intraday positions a few minutes before close
+                if not self._squared_off_today and self._is_square_off_time(now):
+                    self._square_off_all()
+
+                # Once squared off, stop placing new orders for the day —
+                # just idle until the post-market branch triggers EOD.
+                if self._squared_off_today:
+                    logger.info("Squared off for the day — awaiting market close...")
                     time.sleep(60)
                     continue
 
@@ -513,37 +549,48 @@ class NSERLTrader:
         logger.info(f"Top strategies: {best}")
 
     def _run_end_of_day(self):
-        """End of day: square off, update models, save."""
+        """End of day: ensure square-off, sync broker funds, save models & state."""
         logger.info("Market closed. Running end-of-day procedures...")
 
-        # Square off all positions
-        prices = {}
-        for symbol in list(self.portfolio.positions.keys()):
-            price = self._get_current_price(symbol)
-            if price > 0:
-                prices[symbol] = price
-                self._handle_sell(symbol, price, np.zeros(3), 0.0)
+        # 1. Make sure intraday square-off has run (idempotent)
+        if not self._squared_off_today:
+            self._square_off_all()
 
-        if self.trader:
-            self.trader.close_all_positions()
+        # 2. In live mode, refresh local cash from the broker so the
+        #    persisted closing balance matches the actual account.
+        self._sync_cash_from_broker()
 
-        # Run end-of-day model updates
+        # 3. Run end-of-day model updates
         self.trainer.end_of_day_update(self.portfolio.trade_history)
 
-        # Clean old news
+        # 4. Clean old news
         self.news_scraper.clear_old_articles()
 
-        # Final portfolio summary
+        # 5. Persist closing balance for tomorrow's session
+        state_path = self._state_file_path()
+        self.portfolio.save_daily_state(state_path)
+
+        # 6. Final portfolio summary
         summary = self.portfolio.get_portfolio_summary()
         logger.info("=" * 60)
         logger.info("END OF DAY SUMMARY")
-        logger.info(f"Portfolio Value: ₹{summary['portfolio_value']:,.2f}")
-        logger.info(f"Total Return: {summary['total_return']:.2%}")
-        logger.info(f"Realized P&L: ₹{summary['realized_pnl']:,.2f}")
-        logger.info(f"Total Trades: {summary['total_trades']}")
-        logger.info(f"Win Rate: {summary['win_rate']:.2%}")
-        logger.info(f"Max Drawdown: {summary['max_drawdown']:.2%}")
+        logger.info(f"Portfolio Value:   ₹{summary['portfolio_value']:,.2f}")
+        logger.info(f"Closing Cash:      ₹{summary['cash']:,.2f}")
+        logger.info(f"Open Positions:    {summary['num_positions']}")
+        logger.info(f"Today's Return:    {summary['total_return']:.2%}")
+        logger.info(f"Today's Realized:  ₹{summary['realized_pnl']:,.2f}")
+        logger.info(f"Lifetime Realized: ₹{summary['lifetime_realized_pnl']:,.2f}")
+        logger.info(f"Total Trades:      {summary['total_trades']}")
+        logger.info(f"Win Rate:          {summary['win_rate']:.2%}")
+        logger.info(f"Max Drawdown:      {summary['max_drawdown']:.2%}")
+        logger.info(f"Carry-forward to next session: ₹{summary['portfolio_value']:,.2f}")
         logger.info("=" * 60)
+
+        # 7. Telegram EOD notification
+        try:
+            self.telegram.notify_end_of_day(summary)
+        except Exception as e:
+            logger.warning(f"Telegram EOD notify failed: {e}")
 
     def _cleanup(self):
         """Cleanup on shutdown."""
@@ -574,6 +621,179 @@ class NSERLTrader:
         tc = self.config.trading
         market_close = now.replace(hour=tc.trading_end_hour, minute=tc.trading_end_minute, second=0)
         return now > market_close
+
+    # ── Capital flow & square-off ────────────────────────────
+
+    def _state_file_path(self) -> str:
+        """Path to the JSON file holding the previous EOD closing balance."""
+        return os.path.join(self.config.state_dir, "portfolio_state.json")
+
+    @staticmethod
+    def _extract_broker_cash(funds_payload: Dict) -> Optional[float]:
+        """
+        Try to extract an available-cash value from an OpenAlgo funds()
+        response. Different brokers return different keys, so we probe a
+        list of common ones.
+        """
+        if not funds_payload:
+            return None
+        data = funds_payload.get("data", funds_payload)
+        if isinstance(data, list) and data:
+            data = data[0]
+        if not isinstance(data, dict):
+            return None
+
+        candidate_keys = (
+            "availablecash", "available_cash", "availableCash",
+            "availablebalance", "available_balance", "availableBalance",
+            "cash", "netcash", "net_cash", "netCash",
+            "openingbalance", "opening_balance",
+        )
+        for key in candidate_keys:
+            if key in data:
+                try:
+                    val = float(str(data[key]).replace(",", ""))
+                    if val >= 0:
+                        return val
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _determine_starting_balance(self, reset_capital: bool = False) -> Tuple[float, str]:
+        """
+        Decide today's starting capital.
+
+        Priority:
+            1. ``reset_capital=True``         → configured ``initial_capital``
+            2. Live broker funds (non-paper)  → broker available cash
+            3. Saved state from previous EOD  → carry-forward closing balance
+            4. Configured ``initial_capital`` → first-ever run / fallback
+
+        Returns ``(balance, source)`` where source is human-readable.
+        """
+        configured = float(self.config.trading.initial_capital)
+
+        if reset_capital:
+            return configured, "config (forced --reset-capital)"
+
+        # Try the broker first when running live (analyzer mode would just
+        # report OpenAlgo's ₹1Cr virtual capital, which is not what the
+        # user wants for paper carry-forward).
+        if self.trader and not self.config.openalgo.use_analyzer:
+            try:
+                funds = self.trader.get_funds()
+                broker_cash = self._extract_broker_cash(funds)
+                if broker_cash is not None and broker_cash > 0:
+                    return broker_cash, "broker funds()"
+                logger.warning(
+                    "Broker funds() returned no usable cash value; "
+                    "falling back to saved state."
+                )
+            except Exception as e:
+                logger.warning(f"Broker funds() failed: {e}; falling back to saved state.")
+
+        # Carry-forward from previous EOD
+        state = load_daily_state(self._state_file_path())
+        if state:
+            balance = state.get("closing_balance")
+            try:
+                balance = float(balance) if balance is not None else None
+            except (TypeError, ValueError):
+                balance = None
+            if balance and balance > 0:
+                last_date = state.get("last_eod_date", "unknown")
+                return balance, f"carry-forward from {last_date}"
+
+        return configured, "config (first session)"
+
+    def _is_square_off_time(self, now: datetime) -> bool:
+        """True once we've reached the configured intraday square-off time."""
+        tc = self.config.trading
+        threshold = now.replace(
+            hour=tc.square_off_hour,
+            minute=tc.square_off_minute,
+            second=0,
+            microsecond=0,
+        )
+        return now >= threshold
+
+    def _square_off_all(self):
+        """
+        Close every open position (longs + shorts) and cancel pending
+        orders so the trading account ends the day flat.
+        """
+        logger.info("=" * 60)
+        logger.info("INTRADAY SQUARE-OFF: closing all positions")
+        logger.info("=" * 60)
+
+        # 1. Cancel any pending orders so they can't fill after square-off
+        if self.trader:
+            try:
+                self.trader.cancel_all_orders()
+            except Exception as e:
+                logger.warning(f"Cancel-all-orders failed: {e}")
+
+        # 2. Sell every long the local portfolio knows about
+        for symbol in list(self.portfolio.positions.keys()):
+            try:
+                price = self._get_current_price(symbol)
+                if price <= 0:
+                    logger.warning(f"Square-off: no price for {symbol}; using last known")
+                    pos = self.portfolio.positions.get(symbol)
+                    price = pos.current_price if pos else 0.0
+                if price > 0:
+                    self._handle_sell(symbol, price, np.zeros(3), 0.0)
+                else:
+                    # Last resort: force-close locally so we don't carry
+                    # a phantom long into tomorrow.
+                    pos = self.portfolio.positions.pop(symbol, None)
+                    if pos:
+                        logger.error(
+                            f"Force-removing {symbol} locally (qty={pos.quantity}) "
+                            "— no price available for square-off."
+                        )
+            except Exception as e:
+                logger.error(f"Square-off error for {symbol}: {e}")
+
+        # 3. Ask the broker to close anything still open (covers shorts
+        #    and any positions the local book is unaware of).
+        if self.trader:
+            try:
+                self.trader.close_all_positions()
+            except Exception as e:
+                logger.warning(f"Broker close_all_positions failed: {e}")
+
+        self._squared_off_today = True
+
+        summary = self.portfolio.get_portfolio_summary()
+        logger.info(
+            "Square-off complete | cash=₹%.2f | open=%d | realized=₹%.2f",
+            summary["cash"], summary["num_positions"], summary["realized_pnl"],
+        )
+        try:
+            self.telegram.notify_square_off(
+                cash=summary["cash"],
+                portfolio_value=summary["portfolio_value"],
+                realized_pnl=summary["realized_pnl"],
+            )
+        except Exception as e:
+            logger.warning(f"Telegram square-off notify failed: {e}")
+
+    def _sync_cash_from_broker(self):
+        """In live mode, overwrite local cash with the broker's available cash."""
+        if not self.trader or self.config.openalgo.use_analyzer:
+            return
+        try:
+            funds = self.trader.get_funds()
+            broker_cash = self._extract_broker_cash(funds)
+            if broker_cash is not None:
+                logger.info(
+                    "Syncing local cash with broker: ₹%.2f → ₹%.2f",
+                    self.portfolio.cash, broker_cash,
+                )
+                self.portfolio.cash = broker_cash
+        except Exception as e:
+            logger.warning(f"Could not sync broker funds at EOD: {e}")
 
     def run_backtest(self, symbols: Optional[List[str]] = None, years: int = 2):
         """
@@ -700,6 +920,15 @@ def main():
     parser.add_argument("--host", type=str, default="http://127.0.0.1:5000", help="OpenAlgo host URL")
     parser.add_argument("--paper", action="store_true", default=True, help="Use paper trading (analyzer) mode")
     parser.add_argument("--years", type=int, default=2, help="Years for backtest")
+    parser.add_argument(
+        "--reset-capital", action="store_true", default=False,
+        help="Ignore saved state / broker balance and re-seed today's "
+             "session with the configured --capital amount.",
+    )
+    parser.add_argument(
+        "--state-dir", type=str, default="",
+        help="Directory holding portfolio_state.json (defaults to ./state).",
+    )
 
     args = parser.parse_args()
 
@@ -712,6 +941,8 @@ def main():
     if args.host:
         config.openalgo.host = args.host
     config.openalgo.use_analyzer = args.paper
+    if args.state_dir:
+        config.state_dir = args.state_dir
 
     # Run
     system = NSERLTrader(config)
@@ -719,7 +950,7 @@ def main():
     if args.mode == "pretrain":
         system.run_pretrain(symbols=args.symbols, episodes=args.episodes)
     elif args.mode == "trade":
-        system.run_live_trading()
+        system.run_live_trading(reset_capital=args.reset_capital)
     elif args.mode == "backtest":
         system.run_backtest(symbols=args.symbols, years=args.years)
     elif args.mode == "scan":

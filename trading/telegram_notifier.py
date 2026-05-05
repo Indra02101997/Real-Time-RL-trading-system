@@ -124,6 +124,19 @@ class TelegramNotifier:
         )
         self._send_message(text)
 
+    def notify_square_off(self, cash: float, portfolio_value: float, realized_pnl: float):
+        """Notify that the system has squared off all intraday positions."""
+        emoji = "📈" if realized_pnl >= 0 else "📉"
+        text = (
+            f"🏳️ <b>Intraday Square-Off Complete</b>\n"
+            f"All positions closed. No carry-over.\n"
+            f"Cash: ₹{cash:,.2f}\n"
+            f"Portfolio Value: ₹{portfolio_value:,.2f}\n"
+            f"{emoji} Today's Realized P&L: ₹{realized_pnl:,.2f}\n"
+            f"⏰ {datetime.now().strftime('%I:%M %p')}"
+        )
+        self._send_message(text)
+
     def notify_end_of_day(self, summary: dict):
         """Send end-of-day portfolio summary."""
         pv = summary.get("portfolio_value", 0)
